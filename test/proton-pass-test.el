@@ -11,17 +11,19 @@
 (require 'proton-pass)
 
 (defmacro proton-pass-test--with-cli (responses &rest body)
-  "Run BODY with `proton-pass--call' mocked.
+  "Run BODY with pass-cli mocked.
 RESPONSES is an alist of (ARGS . OUTPUT); unknown args signal.  The
-list of calls made is bound to `calls' (most recent first)."
+calls made are bound to `calls' and their stdin to `inputs' (most
+recent first)."
   (declare (indent 1))
-  `(let ((calls nil)
+  `(let ((calls nil) (inputs nil)
          (proton-pass--cache (make-hash-table :test #'equal))
-         (proton-pass--titles nil)
+         (proton-pass--items-cache nil)
          (proton-pass-cache-ttl 3600))
-     (cl-letf (((symbol-function 'proton-pass--call)
-                (lambda (&rest args)
+     (cl-letf (((symbol-function 'proton-pass--call-with-input)
+                (lambda (input &rest args)
                   (push args calls)
+                  (push input inputs)
                   (or (cdr (assoc args ,responses))
                       (user-error "Not mocked: %S" args)))))
        ,@body)))
@@ -125,6 +127,88 @@ list of calls made is bound to `calls' (most recent first)."
       (proton-pass-totp "GitHub")
       (should (equal (car kill-ring) "123456"))
       (proton-pass--clear-kill))))
+
+;;;; Managing items
+
+(ert-deftest proton-pass-test-create-login-uses-stdin ()
+  (proton-pass-test--with-cli
+      '((("item" "create" "login" "--vault-name" "V" "--from-template" "-") . "ok"))
+    (let ((proton-pass-vault "V"))
+      (proton-pass--create-login "New" "me" "hunter2" "https://x.test")
+      (should-not (cl-some (lambda (a) (member "hunter2" a)) calls))
+      (let ((json (json-parse-string (car inputs) :object-type 'alist
+                                     :null-object nil)))
+        (should (equal (alist-get 'title json) "New"))
+        (should (equal (alist-get 'password json) "hunter2"))
+        (should (equal (alist-get 'urls json) ["https://x.test"]))))))
+
+(ert-deftest proton-pass-test-create-login-empty-optionals ()
+  (proton-pass-test--with-cli
+      '((("item" "create" "login" "--vault-name" "V" "--from-template" "-") . "ok"))
+    (let ((proton-pass-vault "V"))
+      (proton-pass--create-login "New" "" "pw" "")
+      (let ((json (json-parse-string (car inputs) :object-type 'alist
+                                     :null-object nil)))
+        (should (null (alist-get 'username json)))
+        (should (equal (alist-get 'urls json) []))))))
+
+(ert-deftest proton-pass-test-update-args ()
+  (proton-pass-test--with-cli
+      '((("item" "update" "--vault-name" "V" "--item-title" "A"
+          "--field" "title=B" "--field" "note=hi") . "ok"))
+    (let ((proton-pass-vault "V"))
+      (proton-pass--update "A" "title" "B" "note" "hi")
+      (should (= (length calls) 1)))))
+
+(ert-deftest proton-pass-test-changed-invalidates ()
+  (let ((proton-pass--cache (make-hash-table :test #'equal))
+        (proton-pass--items-cache '("V" . (x))))
+    (puthash "pass://V/A/password" (cons (current-time) "s") proton-pass--cache)
+    (proton-pass--changed)
+    (should (= 0 (hash-table-count proton-pass--cache)))
+    (should-not proton-pass--items-cache)))
+
+;;;; Browser
+
+(defconst proton-pass-test--list-json
+  "{\"items\":[{\"id\":\"1\",\"share_id\":\"s\",\"title\":\"GitHub\",\"item_type\":\"Login\",\"modify_time\":\"1758800000\"},{\"id\":\"2\",\"share_id\":\"s\",\"title\":\"Notes\",\"item_type\":\"Note\",\"modify_time\":\"1758800000\"}]}")
+
+(ert-deftest proton-pass-test-browser-lists-and-reads-point ()
+  (proton-pass-test--with-cli
+      `((("item" "list" "V" "--filter-state" "active" "--output" "json")
+         . ,proton-pass-test--list-json))
+    (let ((proton-pass-vault "V"))
+      (save-window-excursion
+        (proton-pass)
+        (unwind-protect
+            (progn
+              (should (derived-mode-p 'proton-pass-mode))
+              (should (= 2 (length tabulated-list-entries)))
+              (goto-char (point-min))
+              (should (equal (proton-pass--read-title) "GitHub"))
+              (should (eq (key-binding "w") #'proton-pass-copy-password))
+              (should (eq (key-binding (kbd "RET")) #'proton-pass-view)))
+          (kill-buffer proton-pass-buffer-name))))))
+
+(ert-deftest proton-pass-test-view-masks-secrets ()
+  (with-temp-buffer
+    (let ((proton-pass-vault "V"))
+      (proton-pass--view-insert
+       '((content (title . "GitHub") (note . "a note")
+                  (content (Login (username . "me") (password . "hunter2")
+                                  (totp_uri . "otpauth://x") (urls "https://github.com")))
+                  (extra_fields ((name . "recovery") (content (Hidden . "zzz")))))))
+      (let ((text (buffer-string)))
+        (should (string-match-p "username +me" text))
+        (should (string-match-p "https://github.com" text))
+        (should (string-match-p "recovery +\\*+" text))
+        (should (string-match-p "a note" text))
+        (should-not (string-match-p "hunter2\\|otpauth\\|zzz" text))))))
+
+(ert-deftest proton-pass-test-short-time ()
+  (should (equal (proton-pass--short-time "2026-09-12T02:14:21") "2026-09-12 02:14"))
+  (should (string-match-p "\\`[0-9-]+ [0-9:]+\\'" (proton-pass--short-time "1758800000")))
+  (should (equal (proton-pass--short-time "garbage") "garbage")))
 
 (provide 'proton-pass-test)
 ;;; proton-pass-test.el ends here

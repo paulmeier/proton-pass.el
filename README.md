@@ -1,7 +1,21 @@
 # proton-pass.el
 
-Use [Proton Pass](https://proton.me/pass) from Emacs through its CLI, `pass-cli`.
+Use [Proton Pass](https://proton.me/pass) from Emacs through its CLI,
+`pass-cli`. The commands are modelled on
+[pass.el](https://github.com/NicolasPetton/pass) and `password-store.el`.
 
+![proton-pass.el demo: browsing a vault, viewing a masked item, copying a password and TOTP code, generating a login, trashing an item, and copying a password with completion](demo/demo.gif)
+
+<sub>The demo runs against `demo/pass-cli`, a fake CLI with a made-up
+vault. Re-record it with `make demo` (needs
+[vhs](https://github.com/charmbracelet/vhs)).</sub>
+
+- **Vault browser**: `M-x proton-pass` lists a vault. Single keys copy,
+  view, edit, rename or trash the item at point.
+- **Item management**: insert, generate, edit, rename and trash items,
+  like `password-store-insert`, `-generate`, `-edit`, `-rename` and
+  `-remove`. Trash can be restored from Proton Pass; nothing is deleted
+  permanently.
 - **auth-source backend**: anything that reads credentials through
   auth-source (gptel, smtpmail, forge, sql, tramp, …) can read them from
   Proton Pass.
@@ -16,6 +30,13 @@ Use [Proton Pass](https://proton.me/pass) from Emacs through its CLI, `pass-cli`
 auth-source results carry a *lazy* secret, fetched only when a password
 is actually needed. Fetched secrets are then cached in memory for
 `proton-pass-cache-ttl` seconds (1 hour by default).
+
+## Coverage and roadmap
+
+[`docs/command-matrix.md`](docs/command-matrix.md) maps every `pass-cli`
+command to what this package supports, with an issue for each gap. The
+roadmap lives in the
+[milestones](https://github.com/paulmeier/proton-pass.el/milestones).
 
 ## Requirements
 
@@ -64,31 +85,85 @@ URIs have the form `pass://VAULT/ITEM TITLE/FIELD`. `FIELD` is a
 standard field (`password`, `username`, `email`, …) or the name of a
 custom field.
 
+## The browser
+
+`M-x proton-pass` opens `*Proton Pass*`, a sortable list of the items in
+`proton-pass-vault`. The first listing of a large vault takes a while;
+after that the list is cached until something changes or you press `g`.
+
+| Key         | Action                                   |
+|-------------|------------------------------------------|
+| `RET` / `v` | View the item, with secrets masked       |
+| `w`         | Copy password                            |
+| `b`         | Copy username                            |
+| `f`         | Copy any field                           |
+| `o`         | Copy TOTP code                           |
+| `U`         | Open URL                                 |
+| `e`         | Edit a field (a new name adds a custom field) |
+| `r`         | Rename                                   |
+| `d`         | Move to trash                            |
+| `i` / `I`   | Insert item / insert with generated password |
+| `V`         | Switch vault                             |
+| `g`         | Refresh                                  |
+| `q` / `?`   | Quit / help                              |
+
+The item view buffer has the same keys, and `g` re-fetches the item.
+With evil, bind these keys for normal state (see the Doom example
+below).
+
 ## Commands
+
+In the browser or an item view, commands act on the item at point.
+Elsewhere they prompt for an item with completion.
 
 | Command                                  | Does                                            |
 |------------------------------------------|-------------------------------------------------|
+| `proton-pass`                            | Browse the vault                                |
+| `proton-pass-view`                       | Show an item, secrets masked                    |
 | `proton-pass-copy-password`              | Copy an item's password (auto-clears)           |
 | `proton-pass-copy-username`              | Copy username or email                          |
 | `proton-pass-copy-field`                 | Choose any field of an item and copy it         |
 | `proton-pass-totp`                       | Copy the current TOTP code (auto-clears)        |
-| `proton-pass-insert-generated-password`  | Insert a new random password (prefix = length)  |
+| `proton-pass-insert`                     | Create a login; password read twice, no echo    |
+| `proton-pass-generate`                   | Create a login with a generated password (prefix = length) and copy it |
+| `proton-pass-edit`                       | Set a field; new names become custom fields     |
+| `proton-pass-rename`                     | Rename an item                                  |
+| `proton-pass-remove`                     | Move an item to trash                           |
+| `proton-pass-url`                        | Open an item's URL                              |
+| `proton-pass-switch-vault`               | Change `proton-pass-vault`                      |
+| `proton-pass-insert-generated-password`  | Insert a new random password at point (prefix = length) |
 | `proton-pass-clear-cache`                | Forget cached secrets and titles                |
 | `proton-pass-info`                       | Show the `pass-cli` session                     |
 | `proton-pass-use-ssh-agent`              | Export the Proton Pass SSH agent socket         |
 
-Item completion lists titles from `proton-pass-vault`. Titles are
-cached for the session; call a command with `C-u` to refresh the list.
+Item completion lists titles from `proton-pass-vault`. Call a command
+with `C-u` to refresh the list first.
+
+New passwords are sent to `pass-cli` on stdin. `proton-pass-edit` passes
+the new value as an argument, because that's the only way `pass-cli item
+update` accepts it, so it's briefly visible in the process list.
 
 Example Doom bindings:
 
 ```elisp
 (map! :leader
       (:prefix ("P" . "proton pass")
+       :desc "Browse vault"  "P" #'proton-pass
        :desc "Copy password" "p" #'proton-pass-copy-password
        :desc "Copy username" "u" #'proton-pass-copy-username
-       :desc "Copy field"    "f" #'proton-pass-copy-field
-       :desc "Copy TOTP"     "t" #'proton-pass-totp))
+       :desc "Copy TOTP"     "t" #'proton-pass-totp
+       :desc "Generate item" "g" #'proton-pass-generate))
+
+;; Browser keys in evil normal state. Bind them explicitly rather than
+;; with an overriding map, which would inherit special-mode's SPC.
+(map! :after proton-pass
+      :map (proton-pass-mode-map proton-pass-view-mode-map)
+      :n "w" #'proton-pass-copy-password
+      :n "b" #'proton-pass-copy-username
+      :n "d" #'proton-pass-remove
+      ;; ...and so on for the keys above
+      :map proton-pass-mode-map
+      :n "RET" #'proton-pass-view)
 ```
 
 ## Customization
@@ -106,6 +181,7 @@ Example Doom bindings:
 
 ```sh
 make check   # byte-compile (warnings are errors), checkdoc, ERT tests
+make demo    # re-record demo/demo.gif (needs vhs)
 ```
 
 The tests mock `pass-cli` and never touch a real vault.

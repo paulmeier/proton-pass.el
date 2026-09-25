@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Fake `pass-cli` for recording the README demo.
+
+Implements just the subcommands proton-pass.el uses, over a small
+made-up vault kept in $PROTON_PASS_DEMO_STATE (a JSON file), so
+create/rename/trash show up in the list.  No real data involved.
+"""
+import json, os, random, string, sys
+
+STATE = os.environ.get("PROTON_PASS_DEMO_STATE", "/tmp/proton-pass-demo.json")
+
+SEED = [
+    ("GitHub", "octocat", "https://github.com", True, "2026-09-20T09:12:44"),
+    ("Proton Mail Bridge", "me@example.com", "", False, "2026-09-12T02:14:21"),
+    ("Tailscale API", "example-tailnet", "https://login.tailscale.com", False, "2026-09-25T15:41:03"),
+    ("Anthropic API", "apikey", "https://console.anthropic.com", False, "2026-08-30T18:05:52"),
+    ("Home Router", "admin", "http://192.168.1.1", False, "2026-07-02T21:40:10"),
+    ("Codeberg", "octocat", "https://codeberg.org", True, "2026-06-18T14:46:31"),
+    ("Hacker News", "octocat", "https://news.ycombinator.com", False, "2026-05-11T07:33:19"),
+    ("Fastmail", "me@example.com", "https://fastmail.com", True, "2026-04-27T12:00:00"),
+]
+
+def pw(n=20):
+    return "".join(random.choice(string.ascii_letters + string.digits + "!@#%^&*") for _ in range(n))
+
+def load():
+    if os.path.exists(STATE):
+        return json.load(open(STATE))
+    items = [{"id": str(i), "title": t, "username": u, "password": pw(),
+              "urls": [url] if url else [], "totp": totp, "note": "",
+              "modify_time": m, "extra": []}
+             for i, (t, u, url, totp, m) in enumerate(SEED)]
+    save(items)
+    return items
+
+def save(items):
+    json.dump(items, open(STATE, "w"))
+
+def die(msg):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def opt(args, name, default=None):
+    return args[args.index(name) + 1] if name in args else default
+
+def find(items, title):
+    for it in items:
+        if it["title"] == title:
+            return it
+    die(f"Error retrieving item '{title}'")
+
+def full(it):
+    return {"item": {"id": it["id"], "share_id": "demo", "vault_id": "demo",
+                     "content": {"title": it["title"], "note": it["note"], "item_uuid": it["id"],
+                                 "content": {"Login": {
+                                     "email": "", "username": it["username"],
+                                     "password": it["password"], "urls": it["urls"],
+                                     "totp_uri": "otpauth://totp/demo?secret=DEMO" if it["totp"] else "",
+                                     "passkeys": []}},
+                                 "extra_fields": [{"name": n, "content": {"Hidden": v}}
+                                                  for n, v in it["extra"]]},
+                     "state": "Active", "flags": [], "create_time": it["modify_time"],
+                     "modify_time": it["modify_time"]},
+            "attachments": []}
+
+def main(a):
+    items = load()
+    if a[:2] == ["vault", "list"]:
+        print(json.dumps({"vaults": [{"name": "Personal", "vault_id": "demo", "share_id": "demo"},
+                                     {"name": "Work", "vault_id": "demo2", "share_id": "demo2"}]}))
+    elif a[:2] == ["item", "list"]:
+        print(json.dumps({"items": [{"id": it["id"], "share_id": "demo", "vault_id": "demo",
+                                     "state": "Active", "flags": [],
+                                     "create_time": it["modify_time"], "modify_time": it["modify_time"],
+                                     "title": it["title"], "item_type": "login"} for it in items]}))
+    elif a[:2] == ["item", "view"]:
+        uri = next((x for x in a[2:] if x.startswith("pass://")), None)
+        if uri:
+            _, _, _, title, field = uri.split("/", 4)
+            it = find(items, title)
+            val = {"password": it["password"], "username": it["username"]}.get(field)
+            if val is None:
+                val = dict(it["extra"]).get(field)
+            if val is None:
+                die(f"Field '{field}' not found in item '{title}'")
+            print(val)
+        else:
+            print(json.dumps(full(find(items, opt(a, "--item-title")))))
+    elif a[:2] == ["item", "totp"]:
+        it = find(items, opt(a, "--item-title"))
+        if not it["totp"]:
+            die("Item has no TOTP")
+        print(f"{it['title']}: {random.randint(0, 999999):06d}")
+    elif a[:3] == ["item", "create", "login"]:
+        t = json.loads(sys.stdin.read())
+        items.append({"id": str(len(items) + 100), "title": t["title"],
+                      "username": t.get("username") or "", "password": t["password"],
+                      "urls": t.get("urls") or [], "totp": False, "note": "",
+                      "modify_time": "2026-09-25T17:30:00", "extra": []})
+        save(items)
+        print("Item created")
+    elif a[:2] == ["item", "update"]:
+        it = find(items, opt(a, "--item-title"))
+        for i, x in enumerate(a):
+            if x == "--field":
+                k, v = a[i + 1].split("=", 1)
+                if k in ("title", "username", "password", "note"):
+                    it[k] = v
+                else:
+                    it["extra"].append((k, v))
+        it["modify_time"] = "2026-09-25T17:31:00"
+        save(items)
+        print("Item updated successfully")
+    elif a[:2] == ["item", "trash"]:
+        it = find(items, opt(a, "--item-title"))
+        items.remove(it)
+        save(items)
+        print("Item successfully moved to trash")
+    elif a[:3] == ["password", "generate", "random"]:
+        print(pw(int(opt(a, "--length", "16"))))
+    elif a[:1] == ["info"]:
+        print("- Username: demo\n- Email: demo@example.com")
+    else:
+        die("demo pass-cli: unsupported command " + " ".join(a))
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
