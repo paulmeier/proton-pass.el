@@ -16,7 +16,6 @@ see also the [Roadmap issue](https://github.com/paulmeier/proton-pass.el/issues/
 
 | Issue | Problem |
 |---|---|
-| [#1](https://github.com/paulmeier/proton-pass.el/issues/1) | **Items are selected by title.** Titles aren't unique (36% of items in one real vault share a title), and `pass-cli` silently picks one, so commands can act on the wrong item. Fix before relying on `d`/`r`/`e` in the browser. |
 | [#2](https://github.com/paulmeier/proton-pass.el/issues/2) | `proton-pass-edit` passes the new value in argv (`item update` has no stdin input). |
 | [#7](https://github.com/paulmeier/proton-pass.el/issues/7) | `item list` is synchronous: ~19s for ~1,100 items on first use. |
 
@@ -26,7 +25,7 @@ see also the [Roadmap issue](https://github.com/paulmeier/proton-pass.el/issues/
 |---|---|---|---|
 | `item list` | ✅ | `proton-pass` browser, item completion | [#7](https://github.com/paulmeier/proton-pass.el/issues/7) (speed) |
 | `item list --filter-state trashed` (flag) | ❌ | | [#3](https://github.com/paulmeier/proton-pass.el/issues/3) |
-| `item view` | ✅ | `proton-pass-view`, `proton-pass-get`, copy commands, auth-source | [#1](https://github.com/paulmeier/proton-pass.el/issues/1) (IDs) |
+| `item view` | ✅ | `proton-pass-view`, `proton-pass-get`, copy commands, auth-source | |
 | `item totp` | ✅ | `proton-pass-totp` (`o`) | |
 | `item update` | ✅ | `proton-pass-edit` (`e`), `proton-pass-rename` (`r`) | [#2](https://github.com/paulmeier/proton-pass.el/issues/2) |
 | `item trash` | ✅ | `proton-pass-remove` (`d`) | |
@@ -124,6 +123,16 @@ comment there with a use case.
 |---|---|
 | `agent create` · `agent list` · `agent delete` · `agent monitor` · `agent renew` · `agent instructions` · `agent access grant` · `agent access revoke` | ⛔ |
 | `personal-access-token create` · `list` · `delete` · `renew` · `access grant` · `access revoke` · `access list-access` | ⛔ |
+
+## Item selection
+
+Commands pick items by ID (`--share-id`/`--item-id`, or
+`pass://SHARE_ID/ITEM_ID/field`), never by title, because titles aren't
+unique ([#1](https://github.com/paulmeier/proton-pass.el/issues/1), fixed).
+Completion labels duplicate titles with their modification time.
+Title-based `pass://Vault/Title/field` references are only used where
+you write them yourself (`proton-pass-get`, `proton-pass-auth-source-alist`),
+so those titles must be unique.
 
 ## Beyond pass-cli
 

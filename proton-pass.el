@@ -119,7 +119,9 @@ out of the process list."
                      :null-object nil :false-object nil))
 
 (defun proton-pass--uri (title &optional field vault)
-  "Build a pass:// URI for TITLE, FIELD (default password) and VAULT."
+  "Build a title-based pass:// URI for TITLE, FIELD and VAULT.
+FIELD defaults to password.  Titles aren't unique; this is for
+user-written references such as `proton-pass-auth-source-alist'."
   (format "pass://%s/%s/%s" (or vault proton-pass-vault) title (or field "password")))
 
 ;;;; Secret cache
@@ -171,27 +173,88 @@ With REFRESH, or when the cached list is for another vault, re-list."
     (message nil))
   (cdr proton-pass--items-cache))
 
-(defun proton-pass--read-title (&optional prompt)
-  "Read an item title from `proton-pass-vault' with completion.
-PROMPT defaults to \"Proton Pass item: \".  With a prefix argument,
-refresh the cached item list first.  In a `proton-pass-mode' or item
-view buffer, the item at point is used without prompting."
-  (or (and (not prompt) (proton-pass--title-at-point))
-      (completing-read (or prompt "Proton Pass item: ")
-                       (mapcar (lambda (it) (alist-get 'title it))
-                               (proton-pass--items current-prefix-arg))
-                       nil t)))
+(cl-defstruct (proton-pass-item (:constructor proton-pass-item-create)
+                                 (:copier nil))
+  "Reference to one Proton Pass item.
+Titles aren't unique, so commands act on SHARE-ID and ID; TITLE is
+for display."
+  title share-id id)
 
-(defun proton-pass--login (item)
-  "Return the Login content alist of ITEM, or nil for other types."
-  (alist-get 'Login (alist-get 'content (alist-get 'content item))))
+(defun proton-pass--item-from-list (it)
+  "Make a `proton-pass-item' from IT, an entry of `item list' output."
+  (proton-pass-item-create :title (alist-get 'title it)
+                           :share-id (alist-get 'share_id it)
+                           :id (alist-get 'id it)))
 
-(defun proton-pass--item (title)
-  "Return the full JSON item TITLE from `proton-pass-vault'."
-  (alist-get 'item (proton-pass--json "item" "view"
-                                      "--vault-name" proton-pass-vault
-                                      "--item-title" title
-                                      "--output" "json")))
+(defun proton-pass--item-args (item)
+  "Return the pass-cli arguments that select ITEM by ID."
+  (list "--share-id" (proton-pass-item-share-id item)
+        "--item-id" (proton-pass-item-id item)))
+
+(defun proton-pass--item-uri (item &optional field)
+  "Return the ID-based pass:// URI for FIELD (default password) of ITEM."
+  (format "pass://%s/%s/%s" (proton-pass-item-share-id item)
+          (proton-pass-item-id item) (or field "password")))
+
+(defun proton-pass--resolve (item)
+  "Return ITEM as a `proton-pass-item'.
+ITEM may already be one, or a title string, which must match exactly
+one item in `proton-pass-vault'."
+  (if (proton-pass-item-p item)
+      item
+    (let ((matches (seq-filter (lambda (it) (equal (alist-get 'title it) item))
+                               (proton-pass--items))))
+      (pcase (length matches)
+        (0 (user-error "No item titled %s in %s" item proton-pass-vault))
+        (1 (proton-pass--item-from-list (car matches)))
+        (n (user-error "%d items are titled %s in %s; pick one with completion or the browser"
+                       n item proton-pass-vault))))))
+
+(defun proton-pass--candidates (items)
+  "Return an alist of (DISPLAY . `proton-pass-item') for ITEMS.
+Titles shared by several items get their modification time, and the
+start of their ID if that still collides, so every DISPLAY is unique."
+  (let ((counts (make-hash-table :test #'equal))
+        (seen (make-hash-table :test #'equal)))
+    (dolist (it items)
+      (cl-incf (gethash (alist-get 'title it) counts 0)))
+    (mapcar
+     (lambda (it)
+       (let* ((title (alist-get 'title it))
+              (display (if (= 1 (gethash title counts))
+                           title
+                         (format "%s  (%s)" title
+                                 (proton-pass--short-time (alist-get 'modify_time it))))))
+         (when (gethash display seen)
+           (setq display (format "%s [%s]" display
+                                 (substring (alist-get 'id it) 0
+                                            (min 8 (length (alist-get 'id it)))))))
+         (puthash display t seen)
+         (cons display (proton-pass--item-from-list it))))
+     items)))
+
+(defun proton-pass--read-item (&optional prompt)
+  "Read an item of `proton-pass-vault' with completion.
+Return a `proton-pass-item'.  PROMPT defaults to \"Proton Pass item: \".
+With a prefix argument, refresh the cached item list first.  In a
+`proton-pass-mode' or item view buffer, the item at point is used
+without prompting."
+  (or (and (not prompt) (proton-pass--item-at-point))
+      (let ((candidates (proton-pass--candidates
+                         (proton-pass--items current-prefix-arg))))
+        (cdr (assoc (completing-read (or prompt "Proton Pass item: ")
+                                     candidates nil t)
+                    candidates)))))
+
+(defun proton-pass--login (item-json)
+  "Return the Login content alist of ITEM-JSON, or nil for other types."
+  (alist-get 'Login (alist-get 'content (alist-get 'content item-json))))
+
+(defun proton-pass--item (item)
+  "Return the full JSON of ITEM (a `proton-pass-item' or unique title)."
+  (alist-get 'item (apply #'proton-pass--json "item" "view"
+                          (append (proton-pass--item-args (proton-pass--resolve item))
+                                  '("--output" "json")))))
 
 ;;;; Kill ring with auto-clear
 
@@ -223,50 +286,46 @@ view buffer, the item at point is used without prompting."
 ;;;; Commands
 
 ;;;###autoload
-(defun proton-pass-copy-password (title)
-  "Copy the password of item TITLE."
-  (interactive (list (proton-pass--read-title)))
-  (proton-pass--copy (proton-pass-get (proton-pass--uri title))
-                     (format "password for %s" title)))
+(defun proton-pass-copy-password (item)
+  "Copy the password of ITEM."
+  (interactive (list (proton-pass--read-item)))
+  (let ((item (proton-pass--resolve item)))
+    (proton-pass--copy (proton-pass-get (proton-pass--item-uri item))
+                       (format "password for %s" (proton-pass-item-title item)))))
 
 ;;;###autoload
-(defun proton-pass-copy-username (title)
-  "Copy the username (or email) of item TITLE."
-  (interactive (list (proton-pass--read-title)))
-  (let* ((login (proton-pass--login (proton-pass--item title)))
+(defun proton-pass-copy-username (item)
+  "Copy the username (or email) of ITEM."
+  (interactive (list (proton-pass--read-item)))
+  (let* ((item (proton-pass--resolve item))
+         (login (proton-pass--login (proton-pass--item item)))
          (user (seq-find (lambda (s) (and s (not (string-empty-p s))))
                          (list (alist-get 'username login) (alist-get 'email login)))))
-    (unless user (user-error "%s has no username or email" title))
+    (unless user (user-error "%s has no username or email" (proton-pass-item-title item)))
     ;; Usernames aren't secret: plain kill, no auto-clear.
     (kill-new user)
-    (message "Copied username for %s" title)))
+    (message "Copied username for %s" (proton-pass-item-title item))))
 
 ;;;###autoload
-(defun proton-pass-copy-field (title field)
-  "Copy FIELD of item TITLE, choosing among the fields the item has."
+(defun proton-pass-copy-field (item field)
+  "Copy FIELD of ITEM, choosing among the fields the item has."
   (interactive
-   (let* ((title (proton-pass--read-title))
-          (content (alist-get 'content (proton-pass--item title)))
-          (typed (cdar (alist-get 'content content)))
-          (fields (append
-                   (cl-loop for (k . v) in typed
-                            when (and (stringp v) (not (string-empty-p v)))
-                            collect (symbol-name k))
-                   (delq nil (mapcar (lambda (f) (alist-get 'name f))
-                                     (alist-get 'extra_fields content))))))
-     (list title (completing-read (format "Field of %s: " title) fields nil t))))
-  (proton-pass--copy (proton-pass-get (proton-pass--uri title field))
-                     (format "%s of %s" field title)))
+   (let ((item (proton-pass--read-item)))
+     (list item (completing-read (format "Field of %s: " (proton-pass-item-title item))
+                                 (proton-pass--field-names item) nil t))))
+  (let ((item (proton-pass--resolve item)))
+    (proton-pass--copy (proton-pass-get (proton-pass--item-uri item field))
+                       (format "%s of %s" field (proton-pass-item-title item)))))
 
 ;;;###autoload
-(defun proton-pass-totp (title)
-  "Copy the current TOTP code of item TITLE."
-  (interactive (list (proton-pass--read-title)))
-  (let* ((out (proton-pass--call "item" "totp" "--vault-name" proton-pass-vault
-                                 "--item-title" title))
+(defun proton-pass-totp (item)
+  "Copy the current TOTP code of ITEM."
+  (interactive (list (proton-pass--read-item)))
+  (let* ((item (proton-pass--resolve item))
+         (out (apply #'proton-pass--call "item" "totp" (proton-pass--item-args item)))
          (code (and (string-match "\\b[0-9]\\{6,8\\}\\b" out) (match-string 0 out))))
-    (unless code (user-error "No TOTP code for %s" title))
-    (proton-pass--copy code (format "TOTP for %s" title))))
+    (unless code (user-error "No TOTP code for %s" (proton-pass-item-title item)))
+    (proton-pass--copy code (format "TOTP for %s" (proton-pass-item-title item)))))
 
 ;;;###autoload
 (defun proton-pass-insert-generated-password (length)
@@ -305,13 +364,13 @@ The item is sent on stdin, so PASSWORD never appears in the process list."
    "item" "create" "login" "--vault-name" proton-pass-vault "--from-template" "-")
   (proton-pass--changed))
 
-(defun proton-pass--update (title &rest field-values)
-  "Set FIELD-VALUES (alternating FIELD VALUE strings) on item TITLE.
+(defun proton-pass--update (item &rest field-values)
+  "Set FIELD-VALUES (alternating FIELD VALUE strings) on ITEM.
 Unknown field names become custom fields."
-  (apply #'proton-pass--call "item" "update" "--vault-name" proton-pass-vault
-         "--item-title" title
-         (cl-loop for (f v) on field-values by #'cddr
-                  append (list "--field" (concat f "=" v))))
+  (apply #'proton-pass--call "item" "update"
+         (append (proton-pass--item-args (proton-pass--resolve item))
+                 (cl-loop for (f v) on field-values by #'cddr
+                          append (list "--field" (concat f "=" v)))))
   (proton-pass--changed))
 
 (defun proton-pass--changed ()
@@ -346,46 +405,52 @@ is copied to the kill ring."
     (proton-pass--copy password (format "new password for %s" title))))
 
 ;;;###autoload
-(defun proton-pass-edit (title field value)
-  "Set FIELD of item TITLE to VALUE.
+(defun proton-pass-edit (item field value)
+  "Set FIELD of ITEM to VALUE.
 Offers the item's existing fields; a new name adds a custom field.
 Password-like fields are read without echo."
   (interactive
-   (let* ((title (proton-pass--read-title))
+   (let* ((item (proton-pass--read-item))
+          (title (proton-pass-item-title item))
           (field (completing-read (format "Field of %s to set: " title)
-                                  (proton-pass--field-names title)))
+                                  (proton-pass--field-names item)))
           (value (if (member field '("password" "totp_uri"))
                      (proton-pass--read-new-password title)
                    (read-string (format "New %s: " field)))))
-     (list title field value)))
-  (proton-pass--update title field value)
-  (message "Updated %s of %s" field title))
+     (list item field value)))
+  (let ((item (proton-pass--resolve item)))
+    (proton-pass--update item field value)
+    (message "Updated %s of %s" field (proton-pass-item-title item))))
 
 ;;;###autoload
-(defun proton-pass-rename (title new-title)
-  "Rename item TITLE to NEW-TITLE."
+(defun proton-pass-rename (item new-title)
+  "Rename ITEM to NEW-TITLE."
   (interactive
-   (let ((title (proton-pass--read-title)))
-     (list title (read-string (format "Rename %s to: " title) title))))
-  (proton-pass--update title "title" new-title)
-  (message "Renamed %s to %s" title new-title))
+   (let ((item (proton-pass--read-item)))
+     (list item (read-string (format "Rename %s to: " (proton-pass-item-title item))
+                             (proton-pass-item-title item)))))
+  (let ((item (proton-pass--resolve item)))
+    (proton-pass--update item "title" new-title)
+    (message "Renamed %s to %s" (proton-pass-item-title item) new-title)))
 
 ;;;###autoload
-(defun proton-pass-remove (title)
-  "Move item TITLE to the Proton Pass trash (recoverable)."
-  (interactive (list (proton-pass--read-title)))
-  (when (yes-or-no-p (format "Move %s to trash? " title))
-    (proton-pass--call "item" "trash" "--vault-name" proton-pass-vault
-                       "--item-title" title)
-    (proton-pass--changed)
-    (message "Moved %s to trash" title)))
+(defun proton-pass-remove (item)
+  "Move ITEM to the Proton Pass trash (recoverable)."
+  (interactive (list (proton-pass--read-item)))
+  (let* ((item (proton-pass--resolve item))
+         (title (proton-pass-item-title item)))
+    (when (yes-or-no-p (format "Move %s to trash? " title))
+      (apply #'proton-pass--call "item" "trash" (proton-pass--item-args item))
+      (proton-pass--changed)
+      (message "Moved %s to trash" title))))
 
 ;;;###autoload
-(defun proton-pass-url (title)
-  "Open the first URL of item TITLE with `browse-url'."
-  (interactive (list (proton-pass--read-title)))
-  (let ((url (car (alist-get 'urls (proton-pass--login (proton-pass--item title))))))
-    (unless url (user-error "%s has no URL" title))
+(defun proton-pass-url (item)
+  "Open the first URL of ITEM with `browse-url'."
+  (interactive (list (proton-pass--read-item)))
+  (let* ((item (proton-pass--resolve item))
+         (url (car (alist-get 'urls (proton-pass--login (proton-pass--item item))))))
+    (unless url (user-error "%s has no URL" (proton-pass-item-title item)))
     (browse-url url)))
 
 ;;;###autoload
@@ -402,9 +467,9 @@ Password-like fields are read without echo."
     (with-current-buffer buf (proton-pass-refresh)))
   (message "Proton Pass vault: %s" vault))
 
-(defun proton-pass--field-names (title)
-  "Return the names of the non-empty fields of item TITLE."
-  (let* ((content (alist-get 'content (proton-pass--item title)))
+(defun proton-pass--field-names (item)
+  "Return the names of the non-empty fields of ITEM."
+  (let* ((content (alist-get 'content (proton-pass--item item)))
          (typed (cdar (alist-get 'content content))))
     (append (cl-loop for (k . v) in typed
                      when (and (stringp v) (not (string-empty-p v)))
@@ -414,13 +479,13 @@ Password-like fields are read without echo."
 
 ;;;; Browser: M-x proton-pass
 
-(defvar-local proton-pass--view-title nil
-  "Title of the item shown in a `proton-pass-view-mode' buffer.")
+(defvar-local proton-pass--view-item nil
+  "The `proton-pass-item' shown in a `proton-pass-view-mode' buffer.")
 
-(defun proton-pass--title-at-point ()
-  "Return the item title at point in a Proton Pass buffer, or nil."
+(defun proton-pass--item-at-point ()
+  "Return the `proton-pass-item' at point in a Proton Pass buffer, or nil."
   (cond ((derived-mode-p 'proton-pass-mode) (tabulated-list-get-id))
-        ((derived-mode-p 'proton-pass-view-mode) proton-pass--view-title)))
+        ((derived-mode-p 'proton-pass-view-mode) proton-pass--view-item)))
 
 (defvar-keymap proton-pass-command-map
   :doc "Item commands shared by `proton-pass-mode' and `proton-pass-view-mode'."
@@ -457,7 +522,8 @@ passwords go straight to the kill ring and clear automatically.
   "Tabulated list entries for the current vault; REFRESH re-lists."
   (mapcar (lambda (it)
             (let ((title (alist-get 'title it)))
-              (list title (vector title
+              (list (proton-pass--item-from-list it)
+                    (vector title
                                   (downcase (format "%s" (alist-get 'item_type it)))
                                   (proton-pass--short-time (alist-get 'modify_time it))))))
           (proton-pass--items refresh)))
@@ -523,24 +589,25 @@ passwords go straight to the kill ring and clear automatically.
                         'face 'shadow))))
 
 ;;;###autoload
-(defun proton-pass-view (title)
-  "Show item TITLE with secrets masked."
-  (interactive (list (proton-pass--read-title)))
-  (let ((item (proton-pass--item title))
-        (buf (get-buffer-create (format "*Proton Pass: %s*" title))))
+(defun proton-pass-view (item)
+  "Show ITEM with secrets masked."
+  (interactive (list (proton-pass--read-item)))
+  (let* ((item (proton-pass--resolve item))
+         (json (proton-pass--item item))
+         (buf (get-buffer-create (format "*Proton Pass: %s*" (proton-pass-item-title item)))))
     (with-current-buffer buf
       (proton-pass-view-mode)
-      (setq proton-pass--view-title title)
+      (setq proton-pass--view-item item)
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (proton-pass--view-insert item)
+        (proton-pass--view-insert json)
         (goto-char (point-min))))
     (pop-to-buffer buf)))
 
 (defun proton-pass-view-refresh ()
   "Re-fetch the item in this view buffer."
   (interactive)
-  (proton-pass-view proton-pass--view-title))
+  (proton-pass-view proton-pass--view-item))
 
 ;;;###autoload
 (defun proton-pass-use-ssh-agent ()

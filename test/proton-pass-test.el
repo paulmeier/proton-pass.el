@@ -121,10 +121,10 @@ recent first)."
 
 (ert-deftest proton-pass-test-totp ()
   (proton-pass-test--with-cli
-      '((("item" "totp" "--vault-name" "V" "--item-title" "GitHub") . "GitHub: 123456"))
+      '((("item" "totp" "--share-id" "s" "--item-id" "1") . "GitHub: 123456"))
     (let ((proton-pass-vault "V") (kill-ring nil) (kill-ring-yank-pointer nil)
           (interprogram-cut-function nil))
-      (proton-pass-totp "GitHub")
+      (proton-pass-totp (proton-pass-item-create :title "GitHub" :share-id "s" :id "1"))
       (should (equal (car kill-ring) "123456"))
       (proton-pass--clear-kill))))
 
@@ -154,10 +154,11 @@ recent first)."
 
 (ert-deftest proton-pass-test-update-args ()
   (proton-pass-test--with-cli
-      '((("item" "update" "--vault-name" "V" "--item-title" "A"
+      '((("item" "update" "--share-id" "s" "--item-id" "1"
           "--field" "title=B" "--field" "note=hi") . "ok"))
     (let ((proton-pass-vault "V"))
-      (proton-pass--update "A" "title" "B" "note" "hi")
+      (proton-pass--update (proton-pass-item-create :title "A" :share-id "s" :id "1")
+                           "title" "B" "note" "hi")
       (should (= (length calls) 1)))))
 
 (ert-deftest proton-pass-test-changed-invalidates ()
@@ -185,7 +186,7 @@ recent first)."
               (should (derived-mode-p 'proton-pass-mode))
               (should (= 2 (length tabulated-list-entries)))
               (goto-char (point-min))
-              (should (equal (proton-pass--read-title) "GitHub"))
+              (should (equal (proton-pass-item-title (proton-pass--read-item)) "GitHub"))
               (should (eq (key-binding "w") #'proton-pass-copy-password))
               (should (eq (key-binding (kbd "RET")) #'proton-pass-view)))
           (kill-buffer proton-pass-buffer-name))))))
@@ -209,6 +210,71 @@ recent first)."
   (should (equal (proton-pass--short-time "2026-09-12T02:14:21") "2026-09-12 02:14"))
   (should (string-match-p "\\`[0-9-]+ [0-9:]+\\'" (proton-pass--short-time "1758800000")))
   (should (equal (proton-pass--short-time "garbage") "garbage")))
+
+;;;; Duplicate titles (#1)
+
+(defconst proton-pass-test--dup-json
+  "{\"items\":[{\"id\":\"aaaa1111\",\"share_id\":\"s\",\"title\":\"GitHub\",\"item_type\":\"login\",\"modify_time\":\"2026-09-01T10:00:00\"},{\"id\":\"bbbb2222\",\"share_id\":\"s\",\"title\":\"GitHub\",\"item_type\":\"login\",\"modify_time\":\"2026-09-02T11:30:00\"},{\"id\":\"cccc3333\",\"share_id\":\"s\",\"title\":\"GitHub\",\"item_type\":\"login\",\"modify_time\":\"2026-09-02T11:30:00\"},{\"id\":\"dddd4444\",\"share_id\":\"s\",\"title\":\"Codeberg\",\"item_type\":\"login\",\"modify_time\":\"2026-09-03T09:00:00\"}]}")
+
+(defconst proton-pass-test--dup-responses
+  `((("item" "list" "V" "--filter-state" "active" "--output" "json")
+     . ,proton-pass-test--dup-json)
+    (("item" "trash" "--share-id" "s" "--item-id" "bbbb2222") . "ok")
+    (("item" "update" "--share-id" "s" "--item-id" "cccc3333" "--field" "title=GitHub (old)") . "ok")
+    (("item" "view" "pass://s/bbbb2222/password") . "second-pw")))
+
+(ert-deftest proton-pass-test-dup-candidates-unique ()
+  (let* ((c (proton-pass--candidates
+             (alist-get 'items (json-parse-string proton-pass-test--dup-json
+                                                  :object-type 'alist :array-type 'list))))
+         (names (mapcar #'car c)))
+    (should (equal (length names) (length (delete-dups (copy-sequence names)))))
+    (should (member "Codeberg" names))
+    (should (member "GitHub  (2026-09-01 10:00)" names))
+    ;; Same title and same minute: the ID prefix breaks the tie.
+    (should (member "GitHub  (2026-09-02 11:30) [cccc3333]" names))
+    (should (equal (proton-pass-item-id (cdr (assoc "GitHub  (2026-09-01 10:00)" c)))
+                   "aaaa1111"))))
+
+(ert-deftest proton-pass-test-dup-completion-returns-the-chosen-item ()
+  (proton-pass-test--with-cli proton-pass-test--dup-responses
+    (let ((proton-pass-vault "V"))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_p coll &rest _)
+                   (car (seq-find (lambda (c) (string-prefix-p "GitHub  (2026-09-02 11:30)" (car c)))
+                                  coll)))))
+        (should (equal (proton-pass-item-id (proton-pass--read-item)) "bbbb2222"))))))
+
+(ert-deftest proton-pass-test-dup-title-string-is-rejected ()
+  (proton-pass-test--with-cli proton-pass-test--dup-responses
+    (let ((proton-pass-vault "V"))
+      (should-error (proton-pass--resolve "GitHub") :type 'user-error)
+      (should (equal (proton-pass-item-id (proton-pass--resolve "Codeberg")) "dddd4444"))
+      (should-error (proton-pass--resolve "Nope") :type 'user-error))))
+
+(ert-deftest proton-pass-test-dup-browser-acts-on-row ()
+  (proton-pass-test--with-cli proton-pass-test--dup-responses
+    (let ((proton-pass-vault "V") (kill-ring nil) (kill-ring-yank-pointer nil)
+          (interprogram-cut-function nil))
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+        (save-window-excursion
+          (proton-pass)
+          (unwind-protect
+              (progn
+                ;; Sorted by title: Codeberg, then the three GitHubs.
+                (goto-char (point-min))
+                (while (not (equal (proton-pass-item-id (tabulated-list-get-id)) "bbbb2222"))
+                  (forward-line 1))
+                (proton-pass-copy-password (proton-pass--read-item))
+                (should (equal (car kill-ring) "second-pw"))
+                (proton-pass-remove (proton-pass--read-item))
+                (should (member '("item" "trash" "--share-id" "s" "--item-id" "bbbb2222") calls))
+                (proton-pass-rename (proton-pass-item-create :title "GitHub" :share-id "s"
+                                                             :id "cccc3333")
+                                    "GitHub (old)")
+                (should-not (cl-some (lambda (a) (member "--item-title" a)) calls))
+                (proton-pass--clear-kill))
+            (kill-buffer proton-pass-buffer-name)))))))
 
 (provide 'proton-pass-test)
 ;;; proton-pass-test.el ends here

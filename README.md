@@ -81,7 +81,11 @@ error instead of falling back to `~/.authinfo.gpg`.
 Item titles aren't secret, so this mapping can live in a public dotfiles
 repo.
 
-URIs have the form `pass://VAULT/ITEM TITLE/FIELD`. `FIELD` is a
+URIs have the form `pass://VAULT/ITEM TITLE/FIELD`. Titles aren't
+unique in Proton Pass, and `pass-cli` silently picks one when several
+items share a title, so only reference items with unique titles here.
+Interactive commands don't have this problem: they select items by ID,
+and completion labels duplicate titles with their modification time. `FIELD` is a
 standard field (`password`, `username`, `email`, …) or the name of a
 custom field.
 

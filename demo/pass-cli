@@ -43,11 +43,14 @@ def die(msg):
 def opt(args, name, default=None):
     return args[args.index(name) + 1] if name in args else default
 
-def find(items, title):
+def find(items, title=None, item_id=None):
     for it in items:
-        if it["title"] == title:
+        if (item_id and it["id"] == item_id) or (not item_id and it["title"] == title):
             return it
-    die(f"Error retrieving item '{title}'")
+    die(f"Error retrieving item '{item_id or title}'")
+
+def target(items, a):
+    return find(items, opt(a, "--item-title"), opt(a, "--item-id"))
 
 def full(it):
     return {"item": {"id": it["id"], "share_id": "demo", "vault_id": "demo",
@@ -76,8 +79,8 @@ def main(a):
     elif a[:2] == ["item", "view"]:
         uri = next((x for x in a[2:] if x.startswith("pass://")), None)
         if uri:
-            _, _, _, title, field = uri.split("/", 4)
-            it = find(items, title)
+            _, _, share, key, field = uri.split("/", 4)
+            it = find(items, item_id=key) if share == "demo" else find(items, key)
             val = {"password": it["password"], "username": it["username"]}.get(field)
             if val is None:
                 val = dict(it["extra"]).get(field)
@@ -85,9 +88,9 @@ def main(a):
                 die(f"Field '{field}' not found in item '{title}'")
             print(val)
         else:
-            print(json.dumps(full(find(items, opt(a, "--item-title")))))
+            print(json.dumps(full(target(items, a))))
     elif a[:2] == ["item", "totp"]:
-        it = find(items, opt(a, "--item-title"))
+        it = target(items, a)
         if not it["totp"]:
             die("Item has no TOTP")
         print(f"{it['title']}: {random.randint(0, 999999):06d}")
@@ -100,7 +103,7 @@ def main(a):
         save(items)
         print("Item created")
     elif a[:2] == ["item", "update"]:
-        it = find(items, opt(a, "--item-title"))
+        it = target(items, a)
         for i, x in enumerate(a):
             if x == "--field":
                 k, v = a[i + 1].split("=", 1)
@@ -112,7 +115,7 @@ def main(a):
         save(items)
         print("Item updated successfully")
     elif a[:2] == ["item", "trash"]:
-        it = find(items, opt(a, "--item-title"))
+        it = target(items, a)
         items.remove(it)
         save(items)
         print("Item successfully moved to trash")
